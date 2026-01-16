@@ -66,7 +66,7 @@ function getVendorName(handle) {
 
 // Step 1: Start OAuth flow
 app.get('/auth', (req, res) => {
-  const shop = `${SHOPIFY_STORE}.myshopify.com`;
+  const shop = process.env.SHOPIFY_STORE;
   const state = crypto.randomBytes(16).toString('hex');
   const redirectUri = `${APP_URL}/auth/callback`;
   
