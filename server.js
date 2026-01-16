@@ -1,5 +1,5 @@
 /**
- * HalfCourse Vendor API v2 - OAuth (Fixed)
+ * HalfCourse Vendor API v2 – OAuth (Stabilized)
  */
 
 require('dotenv').config();
@@ -17,24 +17,28 @@ const upload = multer({ storage: multer.memoryStorage() });
 
 const SHOPIFY_CLIENT_ID = process.env.SHOPIFY_CLIENT_ID;
 const SHOPIFY_CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET;
-const SHOPIFY_STORE = process.env.SHOPIFY_STORE; // FULL DOMAIN: half-course.myshopify.com
-const SHOPIFY_SCOPES = process.env.SHOPIFY_SCOPES || 'read_products,write_products,read_orders';
+const SHOPIFY_STORE = process.env.SHOPIFY_STORE?.trim(); // half-course.myshopify.com
+const SHOPIFY_SCOPES =
+  process.env.SHOPIFY_SCOPES ||
+  'read_products,write_products,read_metafields,write_metafields,read_collections';
 const APP_URL = process.env.APP_URL;
 const API_VERSION = '2024-01';
 
-// In-memory token store (replace with DB later)
+// ⚠️ In-memory token store (replace with DB / Redis later)
 const accessTokens = {};
 
 // ================= MIDDLEWARE =================
 
-app.use(cors({
-  origin: [
-    'https://halfcourse.com',
-    'https://www.halfcourse.com',
-    /\.myshopify\.com$/
-  ],
-  credentials: true
-}));
+app.use(
+  cors({
+    origin: [
+      'https://halfcourse.com',
+      'https://www.halfcourse.com',
+      /\.myshopify\.com$/,
+    ],
+    credentials: true,
+  })
+);
 
 app.use(express.json());
 
@@ -46,6 +50,29 @@ const VENDOR_MAP = {
 
 function getVendorName(handle) {
   return VENDOR_MAP[handle] || handle;
+}
+
+// ================= HELPERS =================
+
+function normalizeShop(shop) {
+  return shop?.trim().toLowerCase();
+}
+
+function getAccessToken(shop = SHOPIFY_STORE) {
+  return accessTokens[normalizeShop(shop)] || null;
+}
+
+function getShopifyHeaders(shop) {
+  const token = getAccessToken(shop);
+  if (!token) throw new Error('No access token');
+  return {
+    'Content-Type': 'application/json',
+    'X-Shopify-Access-Token': token,
+  };
+}
+
+function getBaseUrl(shop = SHOPIFY_STORE) {
+  return `https://${shop}/admin/api/${API_VERSION}`;
 }
 
 // ================= OAUTH =================
@@ -74,91 +101,77 @@ app.get('/auth/callback', async (req, res) => {
     return res.status(400).send('Missing OAuth parameters');
   }
 
+  const normalizedShop = normalizeShop(shop);
+
   try {
-    const response = await fetch(`https://${shop}/admin/oauth/access_token`, {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({
-    client_id: SHOPIFY_CLIENT_ID,
-    client_secret: SHOPIFY_CLIENT_SECRET,
-    code,
-    redirect_uri: `${APP_URL}/auth/callback`
-  })
-});
+    const response = await fetch(
+      `https://${normalizedShop}/admin/oauth/access_token`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          client_id: SHOPIFY_CLIENT_ID,
+          client_secret: SHOPIFY_CLIENT_SECRET,
+          code,
+          redirect_uri: `${APP_URL}/auth/callback`,
+        }),
+      }
+    );
 
     const data = await response.json();
-    console.log('OAuth token response:', data);
 
     if (!data.access_token) {
+      console.error('OAuth token error:', data);
       throw new Error(data.error || 'No access token returned');
     }
 
-    // ✅ Store token under FULL shop domain
-    accessTokens[shop] = data.access_token;
+    // ✅ Store token under normalized shop domain
+    accessTokens[normalizedShop] = data.access_token;
 
-    console.log(`✅ Shopify connected: ${shop}`);
+    console.log('✅ Shopify connected:', normalizedShop);
+    console.log('🔐 Stored accessTokens:', Object.keys(accessTokens));
 
     res.send(`
       <html>
-        <body style="font-family: sans-serif; text-align: center; padding: 50px;">
+        <body style="font-family:sans-serif;text-align:center;padding:50px;">
           <h1>✅ Connected!</h1>
           <p>Your store is now connected.</p>
           <p>You can close this window.</p>
         </body>
       </html>
     `);
-
   } catch (err) {
     console.error('OAuth error:', err);
     res.status(500).send('OAuth failed');
   }
 });
 
-// ================= HELPERS =================
-
-function getAccessToken(shop = SHOPIFY_STORE) {
-  return accessTokens[shop] || null;
-}
-
-function getShopifyHeaders(shop) {
-  const token = getAccessToken(shop);
-  if (!token) {
-    throw new Error('No access token');
-  }
-  return {
-    'Content-Type': 'application/json',
-    'X-Shopify-Access-Token': token
-  };
-}
-
-function getBaseUrl(shop = SHOPIFY_STORE) {
-  return `https://${shop}/admin/api/${API_VERSION}`;
-}
-
 // ================= AUTH MIDDLEWARE =================
 
 function requireAuth(req, res, next) {
-  const shop = SHOPIFY_STORE;
-  const token = getAccessToken(shop);
+  const token = getAccessToken();
 
   if (!token) {
     return res.status(401).json({
       error: 'Not authenticated',
-      authUrl: `${APP_URL}/auth`
+      authUrl: `${APP_URL}/auth`,
     });
   }
 
-  req.shop = shop;
+  req.shop = SHOPIFY_STORE;
   req.accessToken = token;
   next();
 }
 
 // ================= API =================
 
-// Status check
-app.get('/api/status', (req, res) => {
+// Health / debug
+app.get('/health', (req, res) => {
   res.json({
-    authenticated: !!getAccessToken()
+    status: 'ok',
+    authenticated: !!getAccessToken(),
+    connectedShops: Object.keys(accessTokens),
+    timestamp: new Date().toISOString(),
   });
 });
 
@@ -168,7 +181,9 @@ app.get('/api/vendors/:handle/products', requireAuth, async (req, res) => {
 
   try {
     const response = await fetch(
-      `${getBaseUrl(req.shop)}/products.json?vendor=${encodeURIComponent(vendorName)}&limit=250`,
+      `${getBaseUrl(req.shop)}/products.json?vendor=${encodeURIComponent(
+        vendorName
+      )}&limit=250`,
       { headers: getShopifyHeaders(req.shop) }
     );
 
@@ -188,12 +203,12 @@ app.get('/', (req, res) => {
   res.send(`
     <html>
       <head><title>HalfCourse Vendor API</title></head>
-      <body style="font-family: sans-serif; text-align: center; padding: 50px;">
+      <body style="font-family:sans-serif;text-align:center;padding:50px;">
         <h1>HalfCourse Vendor API</h1>
         ${
           connected
-            ? '<p style="color: green;">✅ Connected to Shopify</p>'
-            : `<p style="color: orange;">⚠️ Not connected</p>
+            ? '<p style="color:green;">✅ Connected to Shopify</p>'
+            : `<p style="color:orange;">⚠️ Not connected</p>
                <a href="/auth"
                   style="padding:12px 24px;background:#ac380b;color:#fff;
                   text-decoration:none;border-radius:8px;">
@@ -203,16 +218,6 @@ app.get('/', (req, res) => {
       </body>
     </html>
   `);
-});
-
-// ================= HEALTH =================
-
-app.get('/health', (req, res) => {
-  res.json({
-    status: 'ok',
-    authenticated: !!getAccessToken(),
-    timestamp: new Date().toISOString()
-  });
 });
 
 // ================= START =================
