@@ -76,16 +76,18 @@ app.get('/auth/callback', async (req, res) => {
 
   try {
     const response = await fetch(`https://${shop}/admin/oauth/access_token`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        client_id: SHOPIFY_CLIENT_ID,
-        client_secret: SHOPIFY_CLIENT_SECRET,
-        code
-      })
-    });
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({
+    client_id: SHOPIFY_CLIENT_ID,
+    client_secret: SHOPIFY_CLIENT_SECRET,
+    code,
+    redirect_uri: `${APP_URL}/auth/callback`
+  })
+});
 
     const data = await response.json();
+    console.log('OAuth token response:', data);
 
     if (!data.access_token) {
       throw new Error(data.error || 'No access token returned');
