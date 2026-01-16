@@ -17,7 +17,6 @@ const upload = multer({ storage: multer.memoryStorage() });
 
 const SHOPIFY_CLIENT_ID = process.env.SHOPIFY_CLIENT_ID;
 const SHOPIFY_CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET;
-const SHOPIFY_STORE = process.env.SHOPIFY_STORE?.trim(); // half-course.myshopify.com
 const SHOPIFY_SCOPES =
   process.env.SHOPIFY_SCOPES ||
   'read_products,write_products,read_metafields,write_metafields,read_collections';
@@ -58,12 +57,21 @@ function normalizeShop(shop) {
   return shop?.trim().toLowerCase();
 }
 
-function getAccessToken(shop = SHOPIFY_STORE) {
-  return accessTokens[normalizeShop(shop)] || null;
+/**
+ * Returns the currently connected shop.
+ * (Single-store app assumption — fine for HalfCourse)
+ */
+function getActiveShop() {
+  return Object.keys(accessTokens)[0] || null;
+}
+
+function getAccessToken() {
+  const shop = getActiveShop();
+  return shop ? accessTokens[shop] : null;
 }
 
 function getShopifyHeaders(shop) {
-  const token = getAccessToken(shop);
+  const token = accessTokens[shop];
   if (!token) throw new Error('No access token');
   return {
     'Content-Type': 'application/json',
@@ -71,7 +79,7 @@ function getShopifyHeaders(shop) {
   };
 }
 
-function getBaseUrl(shop = SHOPIFY_STORE) {
+function getBaseUrl(shop) {
   return `https://${shop}/admin/api/${API_VERSION}`;
 }
 
@@ -79,12 +87,19 @@ function getBaseUrl(shop = SHOPIFY_STORE) {
 
 // Start OAuth
 app.get('/auth', (req, res) => {
-  const shop = SHOPIFY_STORE;
+  // ⚠️ OAuth must target the shop being installed
+  const shop = req.query.shop;
+
+  if (!shop) {
+    return res.status(400).send('Missing shop parameter');
+  }
+
+  const normalizedShop = normalizeShop(shop);
   const state = crypto.randomBytes(16).toString('hex');
   const redirectUri = `${APP_URL}/auth/callback`;
 
   const authUrl =
-    `https://${shop}/admin/oauth/authorize` +
+    `https://${normalizedShop}/admin/oauth/authorize` +
     `?client_id=${SHOPIFY_CLIENT_ID}` +
     `&scope=${SHOPIFY_SCOPES}` +
     `&redirect_uri=${encodeURIComponent(redirectUri)}` +
@@ -113,7 +128,6 @@ app.get('/auth/callback', async (req, res) => {
           client_id: SHOPIFY_CLIENT_ID,
           client_secret: SHOPIFY_CLIENT_SECRET,
           code,
-          redirect_uri: `${APP_URL}/auth/callback`,
         }),
       }
     );
@@ -129,7 +143,7 @@ app.get('/auth/callback', async (req, res) => {
     accessTokens[normalizedShop] = data.access_token;
 
     console.log('✅ Shopify connected:', normalizedShop);
-    console.log('🔐 Stored accessTokens:', Object.keys(accessTokens));
+    console.log('🔐 Connected shops:', Object.keys(accessTokens));
 
     res.send(`
       <html>
@@ -149,16 +163,17 @@ app.get('/auth/callback', async (req, res) => {
 // ================= AUTH MIDDLEWARE =================
 
 function requireAuth(req, res, next) {
+  const shop = getActiveShop();
   const token = getAccessToken();
 
-  if (!token) {
+  if (!shop || !token) {
     return res.status(401).json({
       error: 'Not authenticated',
       authUrl: `${APP_URL}/auth`,
     });
   }
 
-  req.shop = SHOPIFY_STORE;
+  req.shop = shop;
   req.accessToken = token;
   next();
 }
@@ -209,11 +224,7 @@ app.get('/', (req, res) => {
           connected
             ? '<p style="color:green;">✅ Connected to Shopify</p>'
             : `<p style="color:orange;">⚠️ Not connected</p>
-               <a href="/auth"
-                  style="padding:12px 24px;background:#ac380b;color:#fff;
-                  text-decoration:none;border-radius:8px;">
-                  Connect to Shopify
-               </a>`
+               <p>Install the app via the Shopify Partner Dashboard</p>`
         }
       </body>
     </html>
