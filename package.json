@@ -1,10 +1,11 @@
 {
   "name": "halfcourse-vendor-api",
   "version": "2.0.0",
-  "description": "Backend API for HalfCourse vendor product management",
+  "description": "HalfCourse Vendor Product Editor API - Allows vendors to manage their products without Shopify admin access",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "dev": "node server.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
@@ -15,5 +16,11 @@
   },
   "engines": {
     "node": ">=18.0.0"
-  }
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/lvlewisV/hc-vendor-api-oauth.js"
+  },
+  "author": "HalfCourse",
+  "license": "MIT"
 }
