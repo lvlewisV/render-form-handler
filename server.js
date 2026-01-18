@@ -2,7 +2,7 @@
  * HalfCourse Vendor Product Editor API
  * 
  * A Node.js/Express backend that allows vendors to manage their products
- * without needing Shopify admin access.
+ * and store settings without needing Shopify admin access.
  * 
  * Features:
  * - Shopify OAuth authentication
@@ -11,6 +11,7 @@
  * - Product CRUD operations (filtered by vendor)
  * - Image upload/delete
  * - Metafields support
+ * - Collection/Store settings management (NEW)
  * 
  * Deploy to: Render.com
  * Repository: github.com/lvlewisV/hc-vendor-api-oauth.js
@@ -222,6 +223,91 @@ async function validateProductOwnership(req, res, next) {
   }
 }
 
+/**
+ * Middleware: Validate collection ownership
+ * Ensures the collection belongs to the authenticated vendor
+ */
+async function validateCollectionOwnership(req, res, next) {
+  const collectionHandle = req.params.handle;
+  if (!collectionHandle) return next();
+  
+  // Vendor can only access their own collection (handle must match)
+  if (req.vendorSession.handle !== collectionHandle) {
+    return res.status(403).json({ error: 'Access denied to this collection' });
+  }
+  
+  try {
+    // Get collection by handle
+    const response = await fetch(
+      `https://${SHOPIFY_STORE}.myshopify.com/admin/api/2024-01/custom_collections.json?handle=${collectionHandle}`,
+      {
+        headers: {
+          'X-Shopify-Access-Token': req.shopifyToken,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+    
+    if (!response.ok) {
+      // Try smart collections if custom collection not found
+      const smartResponse = await fetch(
+        `https://${SHOPIFY_STORE}.myshopify.com/admin/api/2024-01/smart_collections.json?handle=${collectionHandle}`,
+        {
+          headers: {
+            'X-Shopify-Access-Token': req.shopifyToken,
+            'Content-Type': 'application/json'
+          }
+        }
+      );
+      
+      if (!smartResponse.ok) {
+        return res.status(404).json({ error: 'Collection not found' });
+      }
+      
+      const smartData = await smartResponse.json();
+      if (!smartData.smart_collections || smartData.smart_collections.length === 0) {
+        return res.status(404).json({ error: 'Collection not found' });
+      }
+      
+      req.collection = smartData.smart_collections[0];
+      req.collectionType = 'smart';
+      return next();
+    }
+    
+    const data = await response.json();
+    if (!data.custom_collections || data.custom_collections.length === 0) {
+      // Try smart collections
+      const smartResponse = await fetch(
+        `https://${SHOPIFY_STORE}.myshopify.com/admin/api/2024-01/smart_collections.json?handle=${collectionHandle}`,
+        {
+          headers: {
+            'X-Shopify-Access-Token': req.shopifyToken,
+            'Content-Type': 'application/json'
+          }
+        }
+      );
+      
+      if (smartResponse.ok) {
+        const smartData = await smartResponse.json();
+        if (smartData.smart_collections && smartData.smart_collections.length > 0) {
+          req.collection = smartData.smart_collections[0];
+          req.collectionType = 'smart';
+          return next();
+        }
+      }
+      
+      return res.status(404).json({ error: 'Collection not found' });
+    }
+    
+    req.collection = data.custom_collections[0];
+    req.collectionType = 'custom';
+    next();
+  } catch (error) {
+    console.error('Error validating collection ownership:', error);
+    res.status(500).json({ error: 'Failed to validate collection ownership' });
+  }
+}
+
 // =============================================================================
 // SHOPIFY API HELPER
 // =============================================================================
@@ -334,6 +420,9 @@ app.get('/', (req, res) => {
             <li><code>POST /api/vendors/:handle/products</code> - Create product</li>
             <li><code>PUT /api/vendors/:handle/products/:id</code> - Update product</li>
             <li><code>DELETE /api/vendors/:handle/products/:id</code> - Delete product</li>
+            <li><code>GET /api/vendors/:handle/settings</code> - Get store settings</li>
+            <li><code>PUT /api/vendors/:handle/settings</code> - Update store settings</li>
+            <li><code>POST /api/vendors/:handle/settings/images</code> - Upload store images</li>
           </ul>
           <p style="margin-top: 20px;">
             <a href="/auth" class="btn">Re-authenticate</a>
@@ -929,6 +1018,357 @@ app.get('/api/vendors/:handle/products/:productId/metafields',
     } catch (error) {
       console.error('Error fetching metafields:', error);
       res.status(500).json({ error: 'Failed to fetch metafields' });
+    }
+  }
+);
+
+// =============================================================================
+// ROUTES: STORE SETTINGS (COLLECTION METAFIELDS)
+// =============================================================================
+
+/**
+ * GET /api/vendors/:handle/settings
+ * Get all store settings (collection + metafields) for a vendor
+ */
+app.get('/api/vendors/:handle/settings',
+  requireShopifyAuth,
+  requireVendorAuth,
+  validateCollectionOwnership,
+  async (req, res) => {
+    try {
+      const collectionId = req.collection.id;
+      
+      // Get collection metafields
+      const metafieldsData = await shopifyFetch(`/collections/${collectionId}/metafields.json`);
+      
+      // Organize metafields by key for easy access
+      const metafields = {};
+      if (metafieldsData.metafields) {
+        for (const mf of metafieldsData.metafields) {
+          metafields[mf.key] = {
+            id: mf.id,
+            namespace: mf.namespace,
+            key: mf.key,
+            value: mf.value,
+            type: mf.type
+          };
+        }
+      }
+      
+      console.log(`✅ Fetched settings for vendor: ${req.params.handle}`);
+      
+      res.json({
+        collection: {
+          id: req.collection.id,
+          handle: req.collection.handle,
+          title: req.collection.title,
+          body_html: req.collection.body_html,
+          image: req.collection.image
+        },
+        metafields: metafields,
+        collectionType: req.collectionType
+      });
+    } catch (error) {
+      console.error('Error fetching store settings:', error);
+      res.status(500).json({ error: 'Failed to fetch store settings' });
+    }
+  }
+);
+
+/**
+ * PUT /api/vendors/:handle/settings
+ * Update store settings (collection metafields)
+ */
+app.put('/api/vendors/:handle/settings',
+  requireShopifyAuth,
+  requireVendorAuth,
+  validateCollectionOwnership,
+  async (req, res) => {
+    try {
+      const collectionId = req.collection.id;
+      const { metafields, collection: collectionUpdates } = req.body;
+      
+      const results = {
+        collection: null,
+        metafields: []
+      };
+      
+      // Update collection if provided (title, body_html)
+      if (collectionUpdates) {
+        const collectionEndpoint = req.collectionType === 'smart' 
+          ? `/smart_collections/${collectionId}.json`
+          : `/custom_collections/${collectionId}.json`;
+        
+        const collectionData = req.collectionType === 'smart'
+          ? { smart_collection: { id: collectionId, ...collectionUpdates } }
+          : { custom_collection: { id: collectionId, ...collectionUpdates } };
+        
+        const collectionResult = await shopifyFetch(collectionEndpoint, {
+          method: 'PUT',
+          body: JSON.stringify(collectionData)
+        });
+        
+        results.collection = collectionResult;
+      }
+      
+      // Update metafields
+      if (metafields && Array.isArray(metafields)) {
+        for (const mf of metafields) {
+          try {
+            if (mf.id) {
+              // Update existing metafield
+              const result = await shopifyFetch(`/metafields/${mf.id}.json`, {
+                method: 'PUT',
+                body: JSON.stringify({
+                  metafield: {
+                    id: mf.id,
+                    value: mf.value
+                  }
+                })
+              });
+              results.metafields.push({ success: true, key: mf.key, result });
+            } else if (mf.value !== undefined && mf.value !== null && mf.value !== '') {
+              // Create new metafield (only if value is not empty)
+              const result = await shopifyFetch(`/collections/${collectionId}/metafields.json`, {
+                method: 'POST',
+                body: JSON.stringify({
+                  metafield: {
+                    namespace: mf.namespace || 'custom',
+                    key: mf.key,
+                    value: mf.value,
+                    type: mf.type || 'single_line_text_field'
+                  }
+                })
+              });
+              results.metafields.push({ success: true, key: mf.key, result });
+            }
+          } catch (mfError) {
+            console.error(`Error updating metafield ${mf.key}:`, mfError);
+            results.metafields.push({ success: false, key: mf.key, error: mfError.message });
+          }
+        }
+      }
+      
+      console.log(`✅ Updated settings for vendor: ${req.params.handle}`);
+      
+      res.json({ success: true, results });
+    } catch (error) {
+      console.error('Error updating store settings:', error);
+      res.status(500).json({ error: 'Failed to update store settings' });
+    }
+  }
+);
+
+/**
+ * DELETE /api/vendors/:handle/settings/metafields/:metafieldId
+ * Delete a specific metafield
+ */
+app.delete('/api/vendors/:handle/settings/metafields/:metafieldId',
+  requireShopifyAuth,
+  requireVendorAuth,
+  validateCollectionOwnership,
+  async (req, res) => {
+    const { metafieldId } = req.params;
+    
+    try {
+      await shopifyFetch(`/metafields/${metafieldId}.json`, {
+        method: 'DELETE'
+      });
+      
+      console.log(`✅ Deleted metafield: ${metafieldId}`);
+      
+      res.json({ success: true, deleted: metafieldId });
+    } catch (error) {
+      console.error('Error deleting metafield:', error);
+      res.status(500).json({ error: 'Failed to delete metafield' });
+    }
+  }
+);
+
+/**
+ * POST /api/vendors/:handle/settings/images
+ * Upload an image for store settings (logo, banner, story images)
+ * Returns the Shopify CDN URL for the uploaded image
+ */
+app.post('/api/vendors/:handle/settings/images',
+  requireShopifyAuth,
+  requireVendorAuth,
+  validateCollectionOwnership,
+  upload.single('image'),
+  async (req, res) => {
+    try {
+      const { imageType, alt } = req.body; // imageType: 'logo', 'banner', 'story_bg', 'story_left', 'story_center', 'story_right'
+      
+      let imageData;
+      
+      if (req.file) {
+        imageData = req.file.buffer.toString('base64');
+      } else if (req.body.attachment) {
+        imageData = req.body.attachment;
+      } else {
+        return res.status(400).json({ error: 'No image provided' });
+      }
+      
+      // We'll use Shopify's Files API to upload the image
+      // First, create a staged upload
+      const stagedUploadQuery = `
+        mutation stagedUploadsCreate($input: [StagedUploadInput!]!) {
+          stagedUploadsCreate(input: $input) {
+            stagedTargets {
+              url
+              resourceUrl
+              parameters {
+                name
+                value
+              }
+            }
+            userErrors {
+              field
+              message
+            }
+          }
+        }
+      `;
+      
+      // For now, we'll store the image as a metafield with base64
+      // This is simpler and works for most use cases
+      // Note: For production with large images, consider using Shopify Files API
+      
+      const collectionId = req.collection.id;
+      const metafieldKey = `${imageType}_image`;
+      
+      // Check if metafield exists
+      const existingMetafields = await shopifyFetch(`/collections/${collectionId}/metafields.json`);
+      const existingMf = existingMetafields.metafields?.find(mf => mf.key === metafieldKey && mf.namespace === 'custom');
+      
+      // For images, we'll store a data URL or upload to collection image
+      // Since metafields have size limits, we'll use the collection image endpoint
+      
+      if (imageType === 'collection_image') {
+        // Update collection image directly
+        const collectionEndpoint = req.collectionType === 'smart' 
+          ? `/smart_collections/${collectionId}.json`
+          : `/custom_collections/${collectionId}.json`;
+        
+        const collectionData = req.collectionType === 'smart'
+          ? { smart_collection: { id: collectionId, image: { attachment: imageData, alt: alt || '' } } }
+          : { custom_collection: { id: collectionId, image: { attachment: imageData, alt: alt || '' } } };
+        
+        const result = await shopifyFetch(collectionEndpoint, {
+          method: 'PUT',
+          body: JSON.stringify(collectionData)
+        });
+        
+        console.log(`✅ Updated collection image for vendor: ${req.params.handle}`);
+        
+        return res.json({ 
+          success: true, 
+          imageType,
+          image: result.smart_collection?.image || result.custom_collection?.image 
+        });
+      }
+      
+      // For other image types, we'll create a temporary product to upload the image
+      // then get the CDN URL and delete the product
+      // This is a workaround since Shopify doesn't have a direct file upload API for free
+      
+      // Create temporary product with image
+      const tempProduct = await shopifyFetch('/products.json', {
+        method: 'POST',
+        body: JSON.stringify({
+          product: {
+            title: `_temp_upload_${Date.now()}`,
+            status: 'draft',
+            images: [{
+              attachment: imageData,
+              alt: alt || imageType
+            }]
+          }
+        })
+      });
+      
+      if (!tempProduct.product || !tempProduct.product.images || tempProduct.product.images.length === 0) {
+        throw new Error('Failed to upload image');
+      }
+      
+      const uploadedImageUrl = tempProduct.product.images[0].src;
+      
+      // Delete the temporary product
+      await shopifyFetch(`/products/${tempProduct.product.id}.json`, {
+        method: 'DELETE'
+      });
+      
+      // Store the CDN URL in metafield
+      const metafieldData = {
+        metafield: {
+          namespace: 'custom',
+          key: metafieldKey,
+          value: uploadedImageUrl,
+          type: 'single_line_text_field'
+        }
+      };
+      
+      let metafieldResult;
+      if (existingMf) {
+        metafieldResult = await shopifyFetch(`/metafields/${existingMf.id}.json`, {
+          method: 'PUT',
+          body: JSON.stringify({ metafield: { id: existingMf.id, value: uploadedImageUrl } })
+        });
+      } else {
+        metafieldResult = await shopifyFetch(`/collections/${collectionId}/metafields.json`, {
+          method: 'POST',
+          body: JSON.stringify(metafieldData)
+        });
+      }
+      
+      console.log(`✅ Uploaded ${imageType} image for vendor: ${req.params.handle}`);
+      
+      res.json({ 
+        success: true, 
+        imageType,
+        url: uploadedImageUrl,
+        metafield: metafieldResult.metafield
+      });
+    } catch (error) {
+      console.error('Error uploading store image:', error);
+      res.status(500).json({ error: 'Failed to upload image' });
+    }
+  }
+);
+
+/**
+ * DELETE /api/vendors/:handle/settings/images/:imageType
+ * Delete an image metafield
+ */
+app.delete('/api/vendors/:handle/settings/images/:imageType',
+  requireShopifyAuth,
+  requireVendorAuth,
+  validateCollectionOwnership,
+  async (req, res) => {
+    const { imageType } = req.params;
+    
+    try {
+      const collectionId = req.collection.id;
+      const metafieldKey = `${imageType}_image`;
+      
+      // Find the metafield
+      const existingMetafields = await shopifyFetch(`/collections/${collectionId}/metafields.json`);
+      const existingMf = existingMetafields.metafields?.find(mf => mf.key === metafieldKey && mf.namespace === 'custom');
+      
+      if (existingMf) {
+        await shopifyFetch(`/metafields/${existingMf.id}.json`, {
+          method: 'DELETE'
+        });
+        
+        console.log(`✅ Deleted ${imageType} image for vendor: ${req.params.handle}`);
+        
+        res.json({ success: true, deleted: imageType });
+      } else {
+        res.json({ success: true, message: 'Image not found' });
+      }
+    } catch (error) {
+      console.error('Error deleting store image:', error);
+      res.status(500).json({ error: 'Failed to delete image' });
     }
   }
 );
