@@ -1189,6 +1189,9 @@ app.delete('/api/vendors/:handle/settings/metafields/:metafieldId',
  * POST /api/vendors/:handle/settings/images
  * Upload an image for store settings (logo, banner, story images)
  * Returns the Shopify CDN URL for the uploaded image
+ * 
+ * UPDATED: Now uses imageType directly as metafield key (no _image suffix)
+ * to match existing Shopify metafield names like 'vendor_logo', 'banner', etc.
  */
 app.post('/api/vendors/:handle/settings/images',
   requireShopifyAuth,
@@ -1197,7 +1200,11 @@ app.post('/api/vendors/:handle/settings/images',
   upload.single('image'),
   async (req, res) => {
     try {
-      const { imageType, alt } = req.body; // imageType: 'logo', 'banner', 'story_bg', 'story_left', 'story_center', 'story_right'
+      const { imageType, alt } = req.body; // imageType: 'vendor_logo', 'banner', 'story_bg_image', 'left_image_1', etc.
+      
+      if (!imageType) {
+        return res.status(400).json({ error: 'imageType is required' });
+      }
       
       let imageData;
       
@@ -1209,41 +1216,13 @@ app.post('/api/vendors/:handle/settings/images',
         return res.status(400).json({ error: 'No image provided' });
       }
       
-      // We'll use Shopify's Files API to upload the image
-      // First, create a staged upload
-      const stagedUploadQuery = `
-        mutation stagedUploadsCreate($input: [StagedUploadInput!]!) {
-          stagedUploadsCreate(input: $input) {
-            stagedTargets {
-              url
-              resourceUrl
-              parameters {
-                name
-                value
-              }
-            }
-            userErrors {
-              field
-              message
-            }
-          }
-        }
-      `;
-      
-      // For now, we'll store the image as a metafield with base64
-      // This is simpler and works for most use cases
-      // Note: For production with large images, consider using Shopify Files API
-      
       const collectionId = req.collection.id;
-      const metafieldKey = `${imageType}_image`;
       
-      // Check if metafield exists
-      const existingMetafields = await shopifyFetch(`/collections/${collectionId}/metafields.json`);
-      const existingMf = existingMetafields.metafields?.find(mf => mf.key === metafieldKey && mf.namespace === 'custom');
+      // FIXED: Use imageType directly as the metafield key
+      // This matches existing metafield names like 'vendor_logo', 'banner', 'story_bg_image'
+      const metafieldKey = imageType;
       
-      // For images, we'll store a data URL or upload to collection image
-      // Since metafields have size limits, we'll use the collection image endpoint
-      
+      // Handle collection image separately
       if (imageType === 'collection_image') {
         // Update collection image directly
         const collectionEndpoint = req.collectionType === 'smart' 
@@ -1268,9 +1247,8 @@ app.post('/api/vendors/:handle/settings/images',
         });
       }
       
-      // For other image types, we'll create a temporary product to upload the image
+      // For other image types, create a temporary product to upload to Shopify's CDN
       // then get the CDN URL and delete the product
-      // This is a workaround since Shopify doesn't have a direct file upload API for free
       
       // Create temporary product with image
       const tempProduct = await shopifyFetch('/products.json', {
@@ -1298,16 +1276,11 @@ app.post('/api/vendors/:handle/settings/images',
         method: 'DELETE'
       });
       
-      // Store the CDN URL in metafield
-      const metafieldData = {
-        metafield: {
-          namespace: 'custom',
-          key: metafieldKey,
-          value: uploadedImageUrl,
-          type: 'single_line_text_field'
-        }
-      };
+      // Check if metafield exists
+      const existingMetafields = await shopifyFetch(`/collections/${collectionId}/metafields.json`);
+      const existingMf = existingMetafields.metafields?.find(mf => mf.key === metafieldKey && mf.namespace === 'custom');
       
+      // Store the CDN URL in metafield
       let metafieldResult;
       if (existingMf) {
         metafieldResult = await shopifyFetch(`/metafields/${existingMf.id}.json`, {
@@ -1317,7 +1290,14 @@ app.post('/api/vendors/:handle/settings/images',
       } else {
         metafieldResult = await shopifyFetch(`/collections/${collectionId}/metafields.json`, {
           method: 'POST',
-          body: JSON.stringify(metafieldData)
+          body: JSON.stringify({
+            metafield: {
+              namespace: 'custom',
+              key: metafieldKey,
+              value: uploadedImageUrl,
+              type: 'single_line_text_field'
+            }
+          })
         });
       }
       
@@ -1339,6 +1319,8 @@ app.post('/api/vendors/:handle/settings/images',
 /**
  * DELETE /api/vendors/:handle/settings/images/:imageType
  * Delete an image metafield
+ * 
+ * UPDATED: Now uses imageType directly as metafield key (no _image suffix)
  */
 app.delete('/api/vendors/:handle/settings/images/:imageType',
   requireShopifyAuth,
@@ -1349,7 +1331,9 @@ app.delete('/api/vendors/:handle/settings/images/:imageType',
     
     try {
       const collectionId = req.collection.id;
-      const metafieldKey = `${imageType}_image`;
+      
+      // FIXED: Use imageType directly as the metafield key
+      const metafieldKey = imageType;
       
       // Find the metafield
       const existingMetafields = await shopifyFetch(`/collections/${collectionId}/metafields.json`);
