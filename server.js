@@ -1664,14 +1664,20 @@ app.post('/api/vendors/:handle/email/test',
       };
 
       const createRes = await fetch('https://api.omnisend.com/v3/campaigns', {
-        method: 'POST',
-        headers: { 'X-API-KEY': apiKey, 'Content-Type': 'application/json' },
-        body: JSON.stringify(campaignPayload),
-      });
+  method: 'POST',
+  headers: { 'X-API-KEY': apiKey, 'Content-Type': 'application/json' },
+  body: JSON.stringify(campaignPayload),
+});
 
-      const createText = await createRes.text();
-      let createData;
-      try { createData = JSON.parse(createText); } catch (_) { createData = {}; }
+const createText = await createRes.text();
+
+console.log('==== OMNISEND DEBUG ====');
+console.log('Status:', createRes.status);
+console.log('Response:', createText);
+console.log('========================');
+
+let createData;
+try { createData = JSON.parse(createText); } catch (_) { createData = {}; }
 
       if (!createRes.ok) {
         console.error('[Email Test] Campaign creation failed:', createText);
