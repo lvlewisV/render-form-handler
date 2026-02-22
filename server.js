@@ -1769,6 +1769,144 @@ app.use((err, req, res, next) => {
   });
 });
 
+// ============================================================
+// HALFCOURSE SERVER.JS — EMAIL ROUTES PATCH
+// ============================================================
+
+const { Resend } = require('resend');
+const resend = new Resend(process.env.RESEND_API_KEY);
+
+// ── HELPER: get subscriber list for a vendor ────────────────
+// Pulls Shopify customers tagged with the vendor handle.
+// Returns array of { email, firstName }
+async function getVendorSubscribers(vendorHandle, shopifyAccessToken, shopifyStore) {
+  try {
+    const tag = vendorHandle; // customers are tagged with vendor handle
+    const url = `https://${shopifyStore}.myshopify.com/admin/api/2024-01/customers.json?tag=${encodeURIComponent(tag)}&limit=250&fields=email,first_name,last_name`;
+    const r = await fetch(url, {
+      headers: { 'X-Shopify-Access-Token': shopifyAccessToken }
+    });
+    if (!r.ok) return [];
+    const data = await r.json();
+    return (data.customers || []).filter(c => c.email);
+  } catch (_) {
+    return [];
+  }
+}
+
+// ── GET /api/vendors/:handle/subscribers/count ───────────────
+// Returns subscriber count for the vendor.
+app.get('/api/vendors/:handle/subscribers/count', verifyToken, async (req, res) => {
+  try {
+    const { handle } = req.params;
+
+    // Verify handle matches the authenticated vendor
+    if (req.vendorHandle !== handle) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+
+    const subs = await getVendorSubscribers(handle, accessToken, process.env.SHOPIFY_STORE);
+    res.json({ count: subs.length, handle });
+  } catch (err) {
+    console.error('subscribers/count error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── POST /api/vendors/:handle/email/test ────────────────────
+// Sends a test email to a single address.
+// Body: { to, subject, previewText, htmlContent }
+app.post('/api/vendors/:handle/email/test', verifyToken, async (req, res) => {
+  try {
+    const { handle } = req.params;
+    if (req.vendorHandle !== handle) return res.status(403).json({ error: 'Forbidden' });
+
+    const { to, subject, htmlContent } = req.body;
+    if (!to || !subject || !htmlContent) {
+      return res.status(400).json({ error: 'Missing required fields: to, subject, htmlContent' });
+    }
+
+    const from = process.env.EMAIL_FROM || 'HalfCourse <noreply@halfcourse.com>';
+
+    const { data, error } = await resend.emails.send({
+      from,
+      to: [to],
+      subject,
+      html: htmlContent,
+    });
+
+    if (error) {
+      console.error('Resend test email error:', error);
+      return res.status(500).json({ error: error.message || 'Failed to send test email' });
+    }
+
+    console.log(`Test email sent to ${to} for vendor ${handle}. id=${data?.id}`);
+    res.json({ success: true, messageId: data?.id });
+  } catch (err) {
+    console.error('email/test error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── POST /api/vendors/:handle/email/send ────────────────────
+// Sends campaign email to ALL subscribers tagged with vendor handle.
+// Body: { subject, previewText, htmlContent }
+app.post('/api/vendors/:handle/email/send', verifyToken, async (req, res) => {
+  try {
+    const { handle } = req.params;
+    if (req.vendorHandle !== handle) return res.status(403).json({ error: 'Forbidden' });
+
+    const { subject, htmlContent } = req.body;
+    if (!subject || !htmlContent) {
+      return res.status(400).json({ error: 'Missing required fields: subject, htmlContent' });
+    }
+
+    const from = process.env.EMAIL_FROM || 'HalfCourse <noreply@halfcourse.com>';
+
+    // Get subscriber list from Shopify
+    const subscribers = await getVendorSubscribers(handle, accessToken, process.env.SHOPIFY_STORE);
+    if (subscribers.length === 0) {
+      return res.status(400).json({ error: 'No subscribers found for this vendor' });
+    }
+
+    // Resend supports up to 50 recipients per call — batch if needed
+    const emails = subscribers.map(c => c.email);
+    const BATCH_SIZE = 50;
+    let sent = 0;
+    const errors = [];
+
+    for (let i = 0; i < emails.length; i += BATCH_SIZE) {
+      const batch = emails.slice(i, i + BATCH_SIZE);
+      const { data, error } = await resend.emails.send({
+        from,
+        to: batch,
+        subject,
+        html: htmlContent,
+      });
+      if (error) {
+        console.error(`Batch ${i}–${i + BATCH_SIZE} error:`, error);
+        errors.push(error.message);
+      } else {
+        sent += batch.length;
+      }
+    }
+
+    console.log(`Campaign sent for vendor ${handle}: ${sent}/${emails.length} delivered`);
+    res.json({ success: true, sent, total: emails.length, errors: errors.length ? errors : undefined });
+  } catch (err) {
+    console.error('email/send error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── GET /api/vendors/:handle/settings ──────────────────────
+// NOTE: If you're getting 401 on /settings, the issue is that
+// your verifyToken middleware is rejecting the token.
+// Quick check — add this temporary debug route to test:
+app.get('/api/vendors/:handle/settings/ping', (req, res) => {
+  res.json({ ok: true, handle: req.params.handle, headers: { auth: req.headers.authorization?.slice(0, 30) } });
+});
+
 // =============================================================================
 // START SERVER
 // =============================================================================
