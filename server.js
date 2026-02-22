@@ -1755,6 +1755,42 @@ try { createData = JSON.parse(createText); } catch (_) { createData = {}; }
 );
 
 // =============================================================================
+// AMAZON SES FOR TESTING
+// =============================================================================
+
+app.post("/api/vendors/:vendor/email/test", async (req, res) => {
+  try {
+    const { to, subject, htmlContent } = req.body;
+
+    if (!to || !subject || !htmlContent) {
+      return res.status(400).json({ error: "Missing required fields" });
+    }
+
+    const params = {
+      Source: process.env.SES_FROM_EMAIL,
+      Destination: {
+        ToAddresses: [to],
+      },
+      Message: {
+        Subject: { Data: subject },
+        Body: {
+          Html: { Data: htmlContent },
+          Text: { Data: "View this email in an HTML-compatible client." }
+        }
+      }
+    };
+
+    await ses.send(new SendEmailCommand(params));
+
+    return res.json({ success: true });
+
+  } catch (err) {
+    console.error("SES test send error:", err);
+    return res.status(500).json({ error: "Test send failed" });
+  }
+});
+
+// =============================================================================
 // ERROR HANDLING
 // =============================================================================
 
