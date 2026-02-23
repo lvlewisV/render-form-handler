@@ -20,6 +20,11 @@
  * Repository: github.com/lvlewisV/hc-vendor-api-oauth.js
  */
 
+const { SESClient, SendEmailCommand } = require("@aws-sdk/client-ses");
+
+const ses = new SESClient({
+  region: process.env.AWS_REGION
+});
 const express = require('express');
 const cors = require('cors');
 const fetch = require('node-fetch');
