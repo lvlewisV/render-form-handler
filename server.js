@@ -1639,6 +1639,17 @@ app.use((err, req, res, next) => {
   });
 });
 
+
+app.get("/sqltest", async (req, res) => {
+  try {
+    const pool = await getSqlPool();
+    const result = await pool.request().query("SELECT GETUTCDATE() as now");
+    res.json({ sql_time: result.recordset[0].now });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
 // =============================================================================
 // START SERVER
 // =============================================================================
