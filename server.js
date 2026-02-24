@@ -297,10 +297,17 @@ async function shopifyFetch(endpoint, options = {}) {
  * Uses HMAC-SHA256 so the token cannot be forged.
  */
 function buildUnsubscribeUrl(email, vendorTag) {
+  const secret = process.env.SES_UNSUBSCRIBE_SECRET;
+
+  if (!secret) {
+    throw new Error('SES_UNSUBSCRIBE_SECRET is not configured');
+  }
+
   const token = crypto
-    .createHmac('sha256', process.env.SES_UNSUBSCRIBE_SECRET || 'changeme')
+    .createHmac('sha256', secret)
     .update(`${email}:${vendorTag}`)
     .digest('hex');
+
   return `${APP_URL}/unsubscribe?email=${encodeURIComponent(email)}&vendor=${encodeURIComponent(vendorTag)}&token=${token}`;
 }
 
@@ -308,9 +315,16 @@ function buildUnsubscribeUrl(email, vendorTag) {
  * Validates an unsubscribe token.
  */
 function validateUnsubscribeToken(email, vendorTag, token) {
+  const secret = process.env.SES_UNSUBSCRIBE_SECRET;
+
+  if (!secret) {
+    console.error('SES_UNSUBSCRIBE_SECRET is not configured');
+    return false;
+  }
+
   try {
     const expected = crypto
-      .createHmac('sha256', process.env.SES_UNSUBSCRIBE_SECRET || 'changeme')
+      .createHmac('sha256', secret)
       .update(`${email}:${vendorTag}`)
       .digest('hex');
 
@@ -338,21 +352,34 @@ function personalizeHtml(htmlContent, email, vendorTag) {
  * Called in a loop — never sends to multiple recipients at once.
  */
 async function sendSingleEmail({ toEmail, subject, htmlContent, vendorTag }) {
+
+  const unsubscribeUrl = buildUnsubscribeUrl(toEmail, vendorTag);
   const personalizedHtml = personalizeHtml(htmlContent, toEmail, vendorTag);
 
   const params = {
     Source: process.env.SES_FROM_EMAIL,
-    Destination: {
-      ToAddresses: [toEmail]
-    },
+    Destination: { ToAddresses: [toEmail] },
     Message: {
       Subject: { Data: subject, Charset: "UTF-8" },
       Body: {
         Html: { Data: personalizedHtml, Charset: "UTF-8" },
-        Text: { Data: 'View this email in an HTML-compatible email client.', Charset: "UTF-8" }
+        Text: {
+          Data: "View this email in an HTML-compatible email client.",
+          Charset: "UTF-8"
+        }
       }
     },
-    ConfigurationSetName: process.env.SES_CONFIG_SET
+    ConfigurationSetName: process.env.SES_CONFIG_SET,
+    Headers: [
+      {
+        Name: "List-Unsubscribe",
+        Value: `<${unsubscribeUrl}>`
+      },
+      {
+        Name: "List-Unsubscribe-Post",
+        Value: "List-Unsubscribe=One-Click"
+      }
+    ]
   };
 
   return ses.send(new SendEmailCommand(params));
@@ -1007,19 +1034,25 @@ app.post('/api/vendors/:handle/email/test',
     if (!to || !subject || !htmlContent) {
       return res.status(400).json({ error: 'Missing required fields: to, subject, htmlContent' });
     }
-    try {
-      await ses.send(new SendEmailCommand({
-        Source: process.env.SES_FROM_EMAIL,
-        Destination: { ToAddresses: [to] },
-        Message: {
-          Subject: { Data: subject },
-          Body: {
-            Html: { Data: htmlContent },
-            Text: { Data: 'View this email in an HTML-compatible email client.' }
-          }
+try {
+  await ses.send(new SendEmailCommand({
+    Source: process.env.SES_FROM_EMAIL,
+    Destination: { ToAddresses: [to] },
+    Message: {
+      Subject: { Data: subject, Charset: "UTF-8" },
+      Body: {
+        Html: {
+          Data: htmlContent,
+          Charset: "UTF-8"
+        },
+        Text: {
+          Data: "View this email in an HTML-compatible email client.",
+          Charset: "UTF-8"
         }
-        // Note: No ConfigurationSetName on test sends — keeps bounce stats clean
-      }));
+      }
+    }
+    // No ConfigurationSetName on test sends
+  }));
       return res.json({ success: true });
     } catch (err) {
       console.error('SES test send error:', err);
