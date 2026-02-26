@@ -1287,32 +1287,60 @@ app.post('/api/vendors/:handle/settings/images',
         });
       }
       
-      // Create temporary product to get a Shopify CDN URL
-      const tempProduct = await shopifyFetch('/products.json', {
-        method: 'POST',
-        body: JSON.stringify({
-          product: {
-            title: `_temp_upload_${Date.now()}`,
-            status: 'draft',
-            images: [{
+      // ── CDN Upload via persistent image-bucket product ──────────────────────
+      // We use a single long-lived draft product per vendor as an image store.
+      // Deleting the product would also delete its images from Shopify's CDN,
+      // so we NEVER delete it — only add images to it.
+      const bucketTitle = `_hc_image_bucket_${req.params.handle}`;
+      let bucketProductId = null;
+
+      // Try to find an existing bucket product for this vendor
+      const searchResult = await shopifyFetch(
+        `/products.json?title=${encodeURIComponent(bucketTitle)}&status=draft&limit=1`
+      );
+      if (searchResult.products && searchResult.products.length > 0) {
+        bucketProductId = searchResult.products[0].id;
+      }
+
+      let uploadedImageUrl;
+
+      if (bucketProductId) {
+        // Add image to the existing bucket product
+        const imgResult = await shopifyFetch(`/products/${bucketProductId}/images.json`, {
+          method: 'POST',
+          body: JSON.stringify({
+            image: {
               attachment: imageData,
               alt: alt || imageType
-            }]
-          }
-        })
-      });
-      
-      if (!tempProduct.product || !tempProduct.product.images || tempProduct.product.images.length === 0) {
-        throw new Error('Failed to upload image');
+            }
+          })
+        });
+        if (!imgResult.image || !imgResult.image.src) {
+          throw new Error('Failed to upload image to bucket product');
+        }
+        uploadedImageUrl = imgResult.image.src;
+      } else {
+        // Create the bucket product for this vendor (first time)
+        const newBucket = await shopifyFetch('/products.json', {
+          method: 'POST',
+          body: JSON.stringify({
+            product: {
+              title: bucketTitle,
+              status: 'draft',
+              published: false,
+              images: [{
+                attachment: imageData,
+                alt: alt || imageType
+              }]
+            }
+          })
+        });
+        if (!newBucket.product || !newBucket.product.images || newBucket.product.images.length === 0) {
+          throw new Error('Failed to create image bucket product');
+        }
+        uploadedImageUrl = newBucket.product.images[0].src;
       }
-      
-      const uploadedImageUrl = tempProduct.product.images[0].src;
-      
-      // Delete the temporary product
-      await shopifyFetch(`/products/${tempProduct.product.id}.json`, {
-        method: 'DELETE'
-      });
-      
+
       // For email-builder image types (email_logo, email_block_*), skip metafield
       // storage — we only need the CDN URL for email delivery.
       if (imageType === 'email_logo' || imageType.startsWith('email_block_')) {
