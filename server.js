@@ -1341,10 +1341,35 @@ app.post('/api/vendors/:handle/settings/images',
         uploadedImageUrl = newBucket.product.images[0].src;
       }
 
-      // For email-builder image types (email_logo, email_block_*), skip metafield
-      // storage — we only need the CDN URL for email delivery.
-      if (imageType === 'email_logo' || imageType.startsWith('email_block_')) {
-        console.log(`✅ Uploaded email image (${imageType}) for vendor: ${req.params.handle}`);
+      // For email block images, skip metafield storage - CDN URL is enough.
+      if (imageType.startsWith('email_block_')) {
+        console.log(`Uploaded email block image (${imageType}) for vendor: ${req.params.handle}`);
+        return res.json({ success: true, imageType, url: uploadedImageUrl });
+      }
+
+      // For email_logo, persist the URL back to the vendor_logo metafield so the
+      // builder pre-loads the correct permanent URL on next session.
+      if (imageType === 'email_logo') {
+        try {
+          const existingMfs = await shopifyFetch(`/collections/${collectionId}/metafields.json`);
+          const existingLogoMf = existingMfs.metafields?.find(mf => mf.key === 'vendor_logo' && mf.namespace === 'custom');
+          if (existingLogoMf) {
+            await shopifyFetch(`/metafields/${existingLogoMf.id}.json`, {
+              method: 'PUT',
+              body: JSON.stringify({ metafield: { id: existingLogoMf.id, value: uploadedImageUrl } })
+            });
+          } else {
+            await shopifyFetch(`/collections/${collectionId}/metafields.json`, {
+              method: 'POST',
+              body: JSON.stringify({
+                metafield: { namespace: 'custom', key: 'vendor_logo', value: uploadedImageUrl, type: 'single_line_text_field' }
+              })
+            });
+          }
+          console.log(`Uploaded email logo and persisted to vendor_logo metafield for vendor: ${req.params.handle}`);
+        } catch (mfErr) {
+          console.error('Warning: could not persist email_logo to metafield:', mfErr.message);
+        }
         return res.json({ success: true, imageType, url: uploadedImageUrl });
       }
 
