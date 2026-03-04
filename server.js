@@ -454,7 +454,7 @@ function buildAudienceQuery(audienceKey, vendorHandle) {
   `;
 
   const baseWhere = `
-    WHERE vs.vendor_tag = @vendorHandle
+    WHERE vs.vendor_handle = @vendorHandle
       AND vs.vendor_status = 'subscribed'
       AND c.global_status = 'subscribed'
       AND c.email IS NOT NULL
