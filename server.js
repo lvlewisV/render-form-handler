@@ -2028,7 +2028,7 @@ app.post('/api/vendors/:handle/email/schedule',
       const campaignId = `${handle}-sched-${Date.now()}`;
 
       // Persist to Azure SQL
-      const pool = await getSqlPool();
+      const pool = await getPool();
       await pool.request()
         .input('campaign_id',   sql.NVarChar, campaignId)
         .input('vendor_handle', sql.NVarChar, handle)
@@ -2074,7 +2074,7 @@ app.post('/api/vendors/:handle/email/schedule',
   async function runDueScheduledCampaigns() {
     let pool;
     try {
-      pool = await getSqlPool();
+      pool = await getPool();
 
       // Claim due campaigns atomically to avoid double-fires on restart
       const claimResult = await pool.request()
