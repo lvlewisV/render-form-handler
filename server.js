@@ -2069,27 +2069,25 @@ app.post('/api/vendors/:handle/email/schedule',
  * pipeline used by /email/send.
  */
 (function startScheduledCampaignRunner() {
-  const POLL_INTERVAL_MS = 60 * 1000; // 1 minute
+  const POLL_INTERVAL_MS = 60 * 1000;
 
   async function runDueScheduledCampaigns() {
-    let pool;
     try {
-      pool = await getPool();
+      const pool = await getPool();
 
-      // Claim due campaigns atomically to avoid double-fires on restart
       const claimResult = await pool.request()
         .input('now', sql.DateTimeOffset, new Date())
         .query(`
           ;WITH due AS (
-          SELECT TOP (5) *
-          FROM scheduled_campaigns
-          WHERE status = 'pending'
-          AND scheduled_at <= @now
-          ORDER BY scheduled_at
-)
-UPDATE due
-SET status = 'processing'
-OUTPUT INSERTED.*;
+            SELECT TOP (5) *
+            FROM scheduled_campaigns
+            WHERE status = 'pending'
+            AND scheduled_at <= @now
+            ORDER BY scheduled_at
+          )
+          UPDATE due
+          SET status = 'processing'
+          OUTPUT INSERTED.*;
         `);
 
       const due = claimResult.recordset;
@@ -2098,63 +2096,70 @@ OUTPUT INSERTED.*;
       console.log(`[SCHEDULE-RUNNER] ${due.length} campaign(s) due`);
 
       for (const campaign of due) {
-        const { id, campaign_id, vendor_handle, audience, subject,
-                preview_text, html_content } = campaign;
-        try {
-          
-          // Fetch audience contacts (reuse same query logic as /email/send)
-const { query } = buildAudienceQuery(audience, vendor_handle);
+        const { id, campaign_id, vendor_handle, audience, subject, html_content } = campaign;
+        let sent = 0, failed = 0;
 
-const contacts = (await pool.request()
-  .input('vendorHandle', sql.NVarChar, vendor_handle)
-  .query(`
-    SELECT DISTINCT c.contact_id, c.email, c.first_name
-    ${query}
-  `)).recordset;
+        try {
+          const { query } = buildAudienceQuery(audience, vendor_handle);
+          const contacts = (await pool.request()
+            .input('vendorHandle', sql.NVarChar, vendor_handle)
+            .query(`SELECT DISTINCT c.contact_id, c.email, c.first_name ${query}`)
+          ).recordset;
 
           if (!contacts.length) {
             await pool.request()
-              .input('id',       sql.Int,          id)
-              .input('sent_at',  sql.DateTimeOffset, new Date())
+              .input('id',      sql.Int,           id)
+              .input('sent_at', sql.DateTimeOffset, new Date())
               .query(`UPDATE scheduled_campaigns SET status='sent', sent_count=0, failed_count=0, sent_at=@sent_at WHERE id=@id`);
             continue;
           }
 
           const vendorDisplayName = VENDOR_MAP[vendor_handle] || vendor_handle;
-          const fromAddress = `${vendorDisplayName} via HalfCourse <hello@halfcourse.com>`;
-          const unsubBase   = `https://halfcourse-vendor-api.onrender.com/unsubscribe`;
-const token = signUnsubscribeToken(contact.email);
-              const unsubLink = `${unsubBase}?email=${encodeURIComponent(contact.email)}&vendor=${vendor_handle}&token=${token}`;
-              const personalised = html_content.replace(/{{UNSUB_LINK}}/g, unsubLink);
+          const fromEmail = process.env.SES_FROM_EMAIL || 'hello@halfcourse.com';
+          const appUrl    = process.env.APP_URL || 'https://halfcourse.com';
 
+          for (const contact of contacts) {
+            try {
+              const token      = signUnsubscribeToken(contact.email);
+              const unsubUrl   = `${appUrl}/api/unsubscribe?token=${token}&vendor=${encodeURIComponent(vendor_handle)}`;
+              const listUnsub  = `<${unsubUrl}>, <mailto:unsubscribe@halfcourse.com?subject=unsubscribe>`;
 
-              await ses.send(new SendEmailCommand({
-                Source:      fromAddress,
+              const personalised = html_content
+                .replace(/{{\s*first_name\s*}}/gi, contact.first_name || 'there')
+                .replace(/UNSUBSCRIBE_LINK/g, unsubUrl);
+
+              const sesResponse = await ses.send(new SendEmailCommand({
+                Source:      `${vendorDisplayName} @ HalfCourse <${fromEmail}>`,
                 Destination: { ToAddresses: [contact.email] },
                 Message: {
-                  Subject: { Data: subject, Charset: 'UTF-8' },
-                  Body:    { Html: { Data: personalised, Charset: 'UTF-8' } }
+                  Subject: { Data: subject },
+                  Body: {
+                    Html: { Data: personalised },
+                    Text: { Data: stripHtmlToText(personalised) + `\n\nTo unsubscribe: ${unsubUrl}` },
+                  },
                 },
-                ConfigurationSetName: process.env.SES_CONFIG_SET,
+                ConfigurationSetName: process.env.SES_CONFIG_SET || undefined,
                 Headers: [
-                  { Name: 'List-Unsubscribe',      Value: `<${unsubLink}>` },
+                  { Name: 'List-Unsubscribe',      Value: listUnsub },
                   { Name: 'List-Unsubscribe-Post', Value: 'List-Unsubscribe=One-Click' },
-                  { Name: 'X-Campaign-ID',         Value: campaign_id }
-                ]
+                  { Name: 'X-Campaign-ID',         Value: campaign_id },
+                ],
               }));
 
-              // Log per-recipient send
               await pool.request()
-                .input('campaign_id', sql.NVarChar, campaign_id)
-                .input('contact_id',  sql.Int,      contact.contact_id)
-                .input('email',       sql.NVarChar, contact.email)
-                .input('status',      sql.NVarChar, 'sent')
-                .input('sent_at',     sql.DateTimeOffset, new Date())
+                .input('campaign_id',    sql.NVarChar,  campaign_id)
+                .input('contact_id',     sql.Int,        contact.contact_id)
+                .input('email',          sql.NVarChar,  contact.email)
+                .input('ses_message_id', sql.NVarChar,  sesResponse.MessageId)
+                .input('status',         sql.NVarChar,  'sent')
+                .input('sent_at',        sql.DateTime2, new Date())
                 .query(`
                   INSERT INTO email_send_recipients
-                  (campaign_id, contact_id, email, ses_message_id, status, sent_at)
-                  VALUES (@campaign_id, @contact_id, @email, NULL, @status, @sent_at)
+                    (campaign_id, contact_id, email, ses_message_id, status, sent_at)
+                  VALUES
+                    (@campaign_id, @contact_id, @email, @ses_message_id, @status, @sent_at)
                 `);
+
               sent++;
             } catch (sendErr) {
               console.error(`[SCHEDULE-RUNNER] Failed for ${contact.email}:`, sendErr.message);
@@ -2162,17 +2167,12 @@ const token = signUnsubscribeToken(contact.email);
             }
           }
 
-          // Mark campaign as sent
           await pool.request()
-            .input('id',          sql.Int,          id)
-            .input('sent_at',     sql.DateTimeOffset, new Date())
-            .input('sent_count',  sql.Int,          sent)
-            .input('failed_count',sql.Int,          failed)
-            .query(`
-              UPDATE scheduled_campaigns
-              SET status='sent', sent_at=@sent_at, sent_count=@sent_count, failed_count=@failed_count
-              WHERE id=@id
-            `);
+            .input('id',           sql.Int,           id)
+            .input('sent_at',      sql.DateTimeOffset, new Date())
+            .input('sent_count',   sql.Int,            sent)
+            .input('failed_count', sql.Int,            failed)
+            .query(`UPDATE scheduled_campaigns SET status='sent', sent_at=@sent_at, sent_count=@sent_count, failed_count=@failed_count WHERE id=@id`);
 
           console.log(`[SCHEDULE-RUNNER] ${campaign_id} done — ${sent} sent, ${failed} failed`);
 
@@ -2189,7 +2189,6 @@ const token = signUnsubscribeToken(contact.email);
     }
   }
 
-  // Run immediately on startup, then on interval
   setTimeout(runDueScheduledCampaigns, 5000);
   setInterval(runDueScheduledCampaigns, POLL_INTERVAL_MS);
   console.log('[SCHEDULE-RUNNER] Started — polling every 60 s');
