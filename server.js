@@ -454,7 +454,7 @@ function buildAudienceQuery(audienceKey, vendorHandle) {
   `;
 
   const baseWhere = `
-    WHERE vs.vendor_tag = @vendorHandle
+    WHERE vs.vendor_handle = @vendorHandle
       AND vs.vendor_status = 'subscribed'
       AND c.global_status = 'subscribed'
       AND c.email IS NOT NULL
@@ -492,7 +492,7 @@ function buildAudienceQuery(audienceKey, vendorHandle) {
           ${baseJoin}
           INNER JOIN contact_orders o
             ON o.contact_id = c.contact_id
-            AND o.vendor_tag = @vendorHandle
+            AND o.vendor_handle = @vendorHandle
           ${baseWhere}
           AND o.order_date >= DATEADD(day, -30, GETUTCDATE())
         `
@@ -504,7 +504,7 @@ function buildAudienceQuery(audienceKey, vendorHandle) {
           ${baseJoin}
           INNER JOIN contact_orders o
             ON o.contact_id = c.contact_id
-            AND o.vendor_tag = @vendorHandle
+            AND o.vendor_handle = @vendorHandle
           ${baseWhere}
           GROUP BY c.contact_id, c.email, c.first_name
           HAVING SUM(o.order_total) >= 250
@@ -517,7 +517,7 @@ function buildAudienceQuery(audienceKey, vendorHandle) {
           ${baseJoin}
           INNER JOIN contact_orders o
             ON o.contact_id = c.contact_id
-            AND o.vendor_tag = @vendorHandle
+            AND o.vendor_handle = @vendorHandle
           ${baseWhere}
           GROUP BY c.contact_id, c.email, c.first_name
           HAVING MAX(o.order_date) <= DATEADD(day, -90, GETUTCDATE())
