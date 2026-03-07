@@ -551,7 +551,7 @@ function injectUtmLinks(html, ctx) {
   const utmBase = [
     'utm_source=halfcourse',
     `utm_medium=email`,
-    `utm_campaign=${encodeURIComponent((ctx.campaign_name || 'campaign').toLowerCase().replace(/\s+/g, '_') + '_' + (ctx.vendor_tag || ''))}`,
+    `utm_campaign=${encodeURIComponent((ctx.campaign_name || '').toLowerCase().replace(/\s+/g, '_') + '_' + (ctx.vendor_tag || ''))}`,
     `utm_content=${encodeURIComponent(ctx.alias || 'link')}`,
     `smtrctid2=${encodeURIComponent(ctx.contact_id || '')}`,
   ].join('&');
