@@ -1942,20 +1942,18 @@ app.post('/api/vendors/:handle/email/send',
       // ── 3. Log campaign to Azure SQL ───────────────────────────────────
       try {
         await pool.request()
-          .input('campaign_id',    sql.NVarChar,  campaignId)
-.input('vendor_handle',  sql.NVarChar,  handle)
-.input('audience',       sql.NVarChar,  audience)
-.input('campaign_name',  sql.NVarChar,  campaignName || '')
-.input('subject',        sql.NVarChar,  subject.trim())
-.input('sent_count',     sql.Int,       sent)
-.input('failed_count',   sql.Int,       failed)
-.input('sent_at',        sql.DateTime2, new Date())
-.query(`
-  INSERT INTO email_send_log
-    (campaign_id, vendor_handle, audience, campaign_name, subject, sent_count, failed_count, sent_at)
-  VALUES
-    (@campaign_id, @vendor_handle, @audience, @campaign_name, @subject, @sent_count, @failed_count, @sent_at)
-`);
+          .input('vendor_tag',    sql.NVarChar,  handle)
+          .input('campaign_name', sql.NVarChar,  campaignName || '')
+          .input('subject',       sql.NVarChar,  subject.trim())
+          .input('message_type',  sql.NVarChar,  'campaign')
+          .input('provider',      sql.NVarChar,  'ses')
+          .input('status',        sql.NVarChar,  sent > 0 ? 'sent' : 'failed')
+          .query(`
+            INSERT INTO email_send_log
+              (vendor_tag, campaign_name, subject, message_type, provider, status, created_at)
+            VALUES
+              (@vendor_tag, @campaign_name, @subject, @message_type, @provider, @status, GETUTCDATE())
+          `);
       } catch (logErr) {
         console.error('[SQL] campaign log error:', logErr.message);
         // Non-fatal — don't fail the response over a logging issue
@@ -2097,18 +2095,20 @@ app.get('/api/vendors/:handle/email/campaigns',
         .input('offset', sql.Int,      offset)
         .query(`
           SELECT
-            campaign_id,
             campaign_name,
             subject,
-            audience,
-            sent_count,
-            failed_count,
-            sent_at,
+            MIN(created_at)                                       AS sent_at,
+            COUNT(*)                                              AS sent_count,
+            COUNT(CASE WHEN status = 'failed' THEN 1 END)        AS failed_count,
+            COUNT(CASE WHEN status = 'opened'   OR
+                            status = 'delivered' THEN 1 END)     AS delivered_count,
             'sent' AS status,
-            NULL   AS scheduled_at
+            NULL   AS scheduled_at,
+            NULL   AS audience
           FROM email_send_log
-          WHERE vendor_handle = @handle
-          ORDER BY sent_at DESC
+          WHERE vendor_tag = @handle
+          GROUP BY campaign_name, subject
+          ORDER BY MIN(created_at) DESC
           OFFSET @offset ROWS FETCH NEXT @limit ROWS ONLY
         `);
 
@@ -2140,45 +2140,8 @@ app.get('/api/vendors/:handle/email/campaigns',
           ORDER BY updated_at DESC
         `);
 
-      // Per-campaign open/click aggregates (from email_send_recipients)
-      const statsResult = await pool.request()
-        .input('handle', sql.NVarChar, handle)
-        .query(`
-          SELECT
-            r.campaign_id,
-            COUNT(CASE WHEN r.status = 'opened'   THEN 1 END) AS opens,
-            COUNT(CASE WHEN r.status = 'clicked'  THEN 1 END) AS clicks,
-            COUNT(CASE WHEN r.status = 'bounced'  THEN 1 END) AS bounces,
-            COUNT(*) AS total_recipients
-          FROM email_send_recipients r
-          INNER JOIN email_send_log l
-            ON r.campaign_id = l.campaign_id
-           AND l.vendor_handle = @handle
-          GROUP BY r.campaign_id
-        `);
-
-      // Map stats by campaign_id
-      const statsMap = {};
-      for (const row of statsResult.recordset) {
-        statsMap[row.campaign_id] = row;
-      }
-
-      // Merge stats into sent campaigns
-      const sent = sentResult.recordset.map(c => ({
-        ...c,
-        opens:   statsMap[c.campaign_id]?.opens   ?? 0,
-        clicks:  statsMap[c.campaign_id]?.clicks  ?? 0,
-        bounces: statsMap[c.campaign_id]?.bounces ?? 0,
-        open_rate: statsMap[c.campaign_id]?.total_recipients > 0
-          ? ((statsMap[c.campaign_id].opens / statsMap[c.campaign_id].total_recipients) * 100).toFixed(1)
-          : null,
-        click_rate: statsMap[c.campaign_id]?.total_recipients > 0
-          ? ((statsMap[c.campaign_id].clicks / statsMap[c.campaign_id].total_recipients) * 100).toFixed(1)
-          : null,
-      }));
-
       return res.json({
-        sent,
+        sent:      sentResult.recordset,
         scheduled: schedResult.recordset,
         drafts:    draftResult.recordset,
       });
@@ -2332,12 +2295,12 @@ app.post(
           INSERT INTO scheduled_campaigns
             (vendor_handle, campaign_name, subject, preview_text,
              blocks_json, state_json, html_content,
-             audience, status, created_at, updated_at)
+             audience, status, scheduled_at, created_at, updated_at)
           OUTPUT INSERTED.id
           VALUES
             (@vendor_handle, @name, @subject, @preview_text,
              @blocks_json, @state_json, @html_content,
-             'draft', 'draft', GETDATE(), GETDATE())
+             'draft', 'draft', '9999-12-31T00:00:00+00:00', GETDATE(), GETDATE())
         `);
 
       const newId = result.recordset[0]?.id;
