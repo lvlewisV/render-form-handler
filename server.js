@@ -459,11 +459,14 @@ function buildAudienceQuery(audienceKey, vendorHandle) {
       AND c.global_status = 'subscribed'
       AND c.email IS NOT NULL
       AND NOT EXISTS (
-        SELECT 1
-        FROM suppressions s
-        WHERE s.email = c.email
-          AND (s.vendor_handle = @vendorHandle OR s.vendor_handle IS NULL)
-      )
+  SELECT 1
+  FROM suppressions s
+  WHERE s.contact_id = c.contact_id
+  AND (
+       s.vendor_tag = @vendorHandle
+       OR s.vendor_scope = 'global'
+  )
+)
   `;
 
   switch (audienceKey) {
@@ -548,7 +551,7 @@ function injectUtmLinks(html, ctx) {
   const utmBase = [
     'utm_source=halfcourse',
     `utm_medium=email`,
-    `utm_campaign=${encodeURIComponent((ctx.campaign_name || '').toLowerCase().replace(/\s+/g, '_') + '_' + (ctx.vendor_handle || ''))}`,
+    `utm_campaign=${encodeURIComponent((ctx.campaign_name || '').toLowerCase().replace(/\s+/g, '_') + '_' + (ctx.vendor_tag || ''))}`,
     `utm_content=${encodeURIComponent(ctx.alias || 'link')}`,
     `smtrctid2=${encodeURIComponent(ctx.contact_id || '')}`,
   ].join('&');
@@ -1742,11 +1745,6 @@ app.post('/api/vendors/:vendor/subscribe', async (req, res) => {
           VALUES (@vendorTag, @contactId, 'subscribed', @source, GETUTCDATE(), GETUTCDATE(), GETUTCDATE());
       `);
 
-    // 4. Fire welcome automation — non-blocking, never fails the subscribe response
-    enqueueWelcomeAutomation(contactId, vendorHandle).catch(err =>
-      console.error('[Automation] Welcome enqueue failed:', err.message)
-    );
-
     console.log(`[Subscribe] ${email} → ${vendorHandle}`);
     return res.json({ success: true });
 
@@ -1929,7 +1927,7 @@ app.post('/api/vendors/:handle/email/send',
               .replace(/UNSUBSCRIBE_LINK/gi, unsubUrl),
             {
               campaign_name: campaignName || '',
-              vendor_handle:    handle,
+              vendor_tag:    handle,
               contact_id:    contact.contact_id,
               alias:         'body',
             }
@@ -1986,7 +1984,7 @@ app.post('/api/vendors/:handle/email/send',
       // ── 3. Log campaign to Azure SQL ───────────────────────────────────
       try {
         await pool.request()
-          .input('vendor_handle',    sql.NVarChar,  handle)
+          .input('vendor_tag',    sql.NVarChar,  handle)
           .input('campaign_name', sql.NVarChar,  campaignName || '')
           .input('subject',       sql.NVarChar,  subject.trim())
           .input('message_type',  sql.NVarChar,  'campaign')
@@ -1994,9 +1992,9 @@ app.post('/api/vendors/:handle/email/send',
           .input('status',        sql.NVarChar,  sent > 0 ? 'sent' : 'failed')
           .query(`
             INSERT INTO email_send_log
-              (vendor_handle, campaign_name, subject, message_type, provider, status, created_at)
+              (vendor_tag, campaign_name, subject, message_type, provider, status, created_at)
             VALUES
-              (@vendor_handle, @campaign_name, @subject, @message_type, @provider, @status, GETUTCDATE())
+              (@vendor_tag, @campaign_name, @subject, @message_type, @provider, @status, GETUTCDATE())
           `);
       } catch (logErr) {
         console.error('[SQL] campaign log error:', logErr.message);
@@ -2165,7 +2163,7 @@ app.get('/api/vendors/:handle/email/campaigns',
               NULL    AS audience,
               'sent'  AS status
             FROM email_send_log
-            WHERE vendor_handle = @handle
+            WHERE vendor_tag = @handle
             GROUP BY campaign_name, subject
           ) AS combined
           ORDER BY sent_at DESC
@@ -2444,7 +2442,7 @@ app.post(
                   .replace(/UNSUBSCRIBE_LINK/gi, unsubUrl),
                 {
                   campaign_name: campaign.campaign_name || '',
-                  vendor_handle:    vendor_handle,
+                  vendor_tag:    vendor_handle,
                   contact_id:    contact.contact_id,
                   alias:         'body',
                 }
@@ -2754,613 +2752,6 @@ app.post("/api/sns/bounce", express.json({ type: "*/*" }), async (req, res) => {
   } catch (err) {
     console.error("[SNS] webhook error:", err.message);
     res.sendStatus(500);
-  }
-});
-
-// =============================================================================
-// AUTOMATION ENGINE
-// =============================================================================
-//
-// HOW IT WORKS
-// ─────────────────────────────────────────────────────────────────────────────
-// 1. Contact subscribes → enqueueWelcomeAutomation() inserts a pending job
-//    for step 1 only (step 2+ are chained by the worker after each send).
-//
-// 2. Contact completes an order → enqueueAutomationJob('post_purchase') is
-//    called from the order webhook.
-//
-// 3. startAutomationWorker() polls every WORKER_INTERVAL_MS. Per tick it:
-//      a. Fetches the contact first (email needed for suppression check).
-//      b. Checks suppressions by email + vendor_handle.
-//      c. Looks up the vendor_emails template for that type + step.
-//         If no active template exists → marks job 'skipped'.
-//      d. Personalises and sends via SES.
-//      e. Marks the job 'sent' and logs the SES MessageId.
-//      f. Chains to the next step using that template's actual delay_hours —
-//         only if an active template exists for step N+1.
-//
-// STEP CHAINING (why pre-enqueuing is wrong)
-// ─────────────────────────────────────────────────────────────────────────────
-// Pre-enqueuing step 2 at subscribe time means:
-//   • The delay is hardcoded, ignoring what the vendor set in vendor_emails.
-//   • If step 2 is skipped (no template), it's marked 'skipped' permanently
-//     and will never fire even if the vendor later creates that template.
-// Chaining solves both: the next step is only enqueued after step N sends,
-// using the real delay_hours from vendor_emails.
-//
-// =============================================================================
-
-const WORKER_INTERVAL_MS = 60_000;
-const WORKER_BATCH_SIZE  = 50;
-
-// ─── Enqueue a single automation job ─────────────────────────────────────────
-async function enqueueAutomationJob({
-  contactId,
-  vendorHandle,
-  automationType,
-  automationStep = 1,
-  delayHours = 0,
-  jobData = null,
-}) {
-  const pool = await getPool();
-
-  // Deduplicate: skip if an identical pending/processing/sent job already exists
-  const existing = await pool.request()
-    .input('contactId',      sql.BigInt,   contactId)
-    .input('vendorHandle',   sql.NVarChar, vendorHandle)
-    .input('automationType', sql.NVarChar, automationType)
-    .input('automationStep', sql.Int,      automationStep)
-    .query(`
-      SELECT 1 FROM automation_jobs
-      WHERE contact_id      = @contactId
-        AND vendor_handle   = @vendorHandle
-        AND automation_type = @automationType
-        AND automation_step = @automationStep
-        AND status IN ('pending','processing','sent')
-    `);
-
-  if (existing.recordset.length > 0) {
-    console.log(`[Automation] Deduped: ${automationType}#${automationStep} for contact ${contactId} / ${vendorHandle}`);
-    return null;
-  }
-
-  const scheduledAt = new Date(Date.now() + delayHours * 3_600_000);
-
-  const result = await pool.request()
-    .input('contactId',      sql.BigInt,   contactId)
-    .input('vendorHandle',   sql.NVarChar, vendorHandle)
-    .input('automationType', sql.NVarChar, automationType)
-    .input('automationStep', sql.Int,      automationStep)
-    .input('scheduledAt',    sql.DateTime2, scheduledAt)
-    .input('jobData',        sql.NVarChar, jobData ? JSON.stringify(jobData) : null)
-    .query(`
-      INSERT INTO automation_jobs
-        (contact_id, vendor_handle, automation_type, automation_step, scheduled_at, status, job_data)
-      OUTPUT INSERTED.job_id
-      VALUES
-        (@contactId, @vendorHandle, @automationType, @automationStep, @scheduledAt, 'pending', @jobData)
-    `);
-
-  const jobId = result.recordset[0]?.job_id;
-  console.log(`[Automation] Enqueued job_id=${jobId} type=${automationType}#${automationStep} contact=${contactId} vendor=${vendorHandle} scheduledAt=${scheduledAt.toISOString()}`);
-  return jobId;
-}
-
-// ─── Welcome: enqueue step 1 only. Steps 2+ are chained by the worker. ───────
-async function enqueueWelcomeAutomation(contactId, vendorHandle) {
-  await enqueueAutomationJob({
-    contactId,
-    vendorHandle,
-    automationType: 'welcome',
-    automationStep: 1,
-    delayHours: 0,
-  });
-}
-
-// ─── Worker: process pending jobs ────────────────────────────────────────────
-async function processAutomationJobs() {
-  let pool;
-  try {
-    pool = await getPool();
-  } catch (err) {
-    console.error('[AutoWorker] DB connection error:', err.message);
-    return;
-  }
-
-  let jobs;
-  try {
-    // Atomically lock a batch of due pending jobs
-    const result = await pool.request()
-      .input('batchSize', sql.Int, WORKER_BATCH_SIZE)
-      .query(`
-        UPDATE TOP (@batchSize) automation_jobs
-        SET    status     = 'processing',
-               updated_at = GETUTCDATE()
-        OUTPUT
-          INSERTED.job_id,
-          INSERTED.contact_id,
-          INSERTED.vendor_handle,
-          INSERTED.automation_type,
-          INSERTED.automation_step,
-          INSERTED.job_data
-        WHERE  status       = 'pending'
-          AND  scheduled_at <= GETUTCDATE()
-      `);
-    jobs = result.recordset;
-  } catch (err) {
-    console.error('[AutoWorker] Fetch/lock error:', err.message);
-    return;
-  }
-
-  if (jobs.length === 0) return;
-  console.log(`[AutoWorker] Processing ${jobs.length} job(s)`);
-
-  for (const job of jobs) {
-    await processSingleJob(pool, job);
-  }
-}
-
-async function processSingleJob(pool, job) {
-  const { job_id, contact_id, vendor_handle, automation_type, automation_step } = job;
-  const tag = `[AutoWorker job=${job_id} ${automation_type}#${automation_step} vendor=${vendor_handle}]`;
-
-  try {
-    // ── 1. Fetch contact first (email is needed for the suppression check) ──
-    const contactResult = await pool.request()
-      .input('contactId', sql.BigInt, contact_id)
-      .query(`
-        SELECT email, first_name, last_name
-        FROM contacts
-        WHERE contact_id = @contactId
-          AND global_status = 'subscribed'
-      `);
-
-    if (!contactResult.recordset.length) {
-      console.log(`${tag} Contact not found or unsubscribed — skipping`);
-      return await markJob(pool, job_id, 'skipped');
-    }
-
-    const contact = contactResult.recordset[0];
-
-    // ── 2. Check suppression by email + vendor_handle ────────────────────────
-    const suppressed = await pool.request()
-      .input('email',        sql.NVarChar, contact.email)
-      .input('vendorHandle', sql.NVarChar, vendor_handle)
-      .query(`
-        SELECT 1 FROM suppressions
-        WHERE email = @email
-          AND (vendor_handle = @vendorHandle OR vendor_handle IS NULL)
-      `);
-
-    if (suppressed.recordset.length > 0) {
-      console.log(`${tag} Contact suppressed — skipping`);
-      return await markJob(pool, job_id, 'skipped');
-    }
-
-    // ── 3. Fetch the vendor's email template for this type + step ────────────
-    const templateResult = await pool.request()
-      .input('vendorHandle',   sql.NVarChar, vendor_handle)
-      .input('automationType', sql.NVarChar, automation_type)
-      .input('automationStep', sql.Int,      automation_step)
-      .query(`
-        SELECT email_id, subject, html_content, delay_hours
-        FROM vendor_emails
-        WHERE vendor_handle   = @vendorHandle
-          AND automation_type = @automationType
-          AND automation_step = @automationStep
-          AND active          = 1
-      `);
-
-    if (!templateResult.recordset.length) {
-      console.log(`${tag} No active template found — skipping`);
-      return await markJob(pool, job_id, 'skipped');
-    }
-
-    const template = templateResult.recordset[0];
-
-    // ── 4. Personalise content ───────────────────────────────────────────────
-    const unsubToken  = signUnsubscribeToken(contact.email);
-    const unsubUrl    = `${APP_URL}/api/unsubscribe?token=${unsubToken}&vendor=${vendor_handle}`;
-    const fromAddress = process.env.SES_FROM_EMAIL || 'noreply@halfcourse.com';
-
-    const personalize = (str) =>
-      (str || '')
-        .replace(/\{\{first_name\}\}/gi,      contact.first_name || 'Friend')
-        .replace(/\{\{last_name\}\}/gi,       contact.last_name  || '')
-        .replace(/\{\{email\}\}/gi,           contact.email)
-        .replace(/\{\{unsubscribe_url\}\}/gi, unsubUrl)
-        .replace(/\{\{vendor_handle\}\}/gi,   vendor_handle);
-
-    const subject     = personalize(template.subject);
-    const htmlContent = injectUtmLinks(personalize(template.html_content), {
-      campaign_name: `${automation_type}_step${automation_step}`,
-      vendor_handle:    vendor_handle,
-      contact_id:    contact_id,
-      alias:         `auto_${automation_type}_${automation_step}`,
-    });
-    const textContent = stripHtmlToText(htmlContent);
-
-    // ── 5. Send via SES ──────────────────────────────────────────────────────
-    const sesResult = await ses.send(new SendEmailCommand({
-      Source:      fromAddress,
-      Destination: { ToAddresses: [contact.email] },
-      Message: {
-        Subject: { Data: subject },
-        Body: {
-          Html: { Data: htmlContent },
-          Text: { Data: textContent },
-        },
-      },
-      ConfigurationSetName: process.env.SES_CONFIG_SET || undefined,
-      Headers: [
-        {
-          Name:  'List-Unsubscribe',
-          Value: `<${unsubUrl}>, <mailto:unsubscribe@halfcourse.com?subject=unsubscribe>`,
-        },
-        {
-          Name:  'List-Unsubscribe-Post',
-          Value: 'List-Unsubscribe=One-Click',
-        },
-      ],
-    }));
-
-    const sesMessageId = sesResult.MessageId || null;
-    console.log(`${tag} Sent to ${contact.email} SES MessageId=${sesMessageId}`);
-
-    // ── 6. Mark job sent ─────────────────────────────────────────────────────
-    await pool.request()
-      .input('jobId',     sql.Int,      job_id)
-      .input('messageId', sql.NVarChar, sesMessageId)
-      .query(`
-        UPDATE automation_jobs
-        SET status       = 'sent',
-            message_id   = @messageId,
-            processed_at = GETUTCDATE(),
-            updated_at   = GETUTCDATE()
-        WHERE job_id = @jobId
-      `);
-
-    // Log to shared recipients table for SNS event reconciliation
-    try {
-      const campaignId = `auto_${vendor_handle}_${automation_type}_${automation_step}_${job_id}`;
-      await pool.request()
-        .input('campaignId',   sql.NVarChar, campaignId)
-        .input('contactId',    sql.Int,      contact_id)
-        .input('email',        sql.NVarChar, contact.email)
-        .input('sesMessageId', sql.NVarChar, sesMessageId)
-        .query(`
-          INSERT INTO email_send_recipients (campaign_id, contact_id, email, ses_message_id, status)
-          VALUES (@campaignId, @contactId, @email, @sesMessageId, 'sent')
-        `);
-    } catch (recipErr) {
-      console.error(`${tag} Failed to log email_send_recipients:`, recipErr.message);
-    }
-
-    // ── 7. Update welcome_email_sent flag if this is welcome step 1 ─────────
-    if (automation_type === 'welcome' && automation_step === 1) {
-      try {
-        await pool.request()
-          .input('contactId',    sql.BigInt,  contact_id)
-          .input('vendorHandle', sql.NVarChar, vendor_handle)
-          .query(`
-            UPDATE vendor_subscriptions
-            SET welcome_email_sent = 1, updated_at = GETUTCDATE()
-            WHERE contact_id    = @contactId
-              AND vendor_handle = @vendorHandle
-          `);
-      } catch (wsErr) {
-        console.error(`${tag} Failed to set welcome_email_sent:`, wsErr.message);
-      }
-    }
-
-    // ── 8. Chain to next step using vendor's configured delay_hours ──────────
-    // Only enqueued if the vendor has created an active template for step N+1.
-    // This means delay is always pulled from the template the vendor wrote,
-    // and steps can only fire for steps the vendor has actually configured.
-    const nextStep = automation_step + 1;
-    try {
-      const nextTemplate = await pool.request()
-        .input('vendorHandle',   sql.NVarChar, vendor_handle)
-        .input('automationType', sql.NVarChar, automation_type)
-        .input('automationStep', sql.Int,      nextStep)
-        .query(`
-          SELECT delay_hours FROM vendor_emails
-          WHERE vendor_handle   = @vendorHandle
-            AND automation_type = @automationType
-            AND automation_step = @automationStep
-            AND active          = 1
-        `);
-
-      if (nextTemplate.recordset.length > 0) {
-        const nextDelay = nextTemplate.recordset[0].delay_hours || 0;
-        await enqueueAutomationJob({
-          contactId:      contact_id,
-          vendorHandle:   vendor_handle,
-          automationType: automation_type,
-          automationStep: nextStep,
-          delayHours:     nextDelay,
-        });
-        console.log(`${tag} Chained → step ${nextStep} in ${nextDelay}h`);
-      }
-    } catch (chainErr) {
-      // Non-fatal — the send already succeeded
-      console.error(`${tag} Step chaining error:`, chainErr.message);
-    }
-
-  } catch (err) {
-    console.error(`${tag} Error:`, err.message);
-    await markJob(pool, job_id, 'failed');
-  }
-}
-
-async function markJob(pool, jobId, status) {
-  try {
-    await pool.request()
-      .input('jobId',  sql.Int,      jobId)
-      .input('status', sql.NVarChar, status)
-      .query(`
-        UPDATE automation_jobs
-        SET status = @status, processed_at = GETUTCDATE(), updated_at = GETUTCDATE()
-        WHERE job_id = @jobId
-      `);
-  } catch (err) {
-    console.error(`[AutoWorker] markJob(${jobId}, ${status}) error:`, err.message);
-  }
-}
-
-setTimeout(() => {
-  console.log(`[AutoWorker] Started — polling every ${WORKER_INTERVAL_MS / 1000}s`);
-  setInterval(processAutomationJobs, WORKER_INTERVAL_MS);
-  processAutomationJobs();
-}, 5_000);
-
-// =============================================================================
-// ROUTES: AUTOMATION EMAIL TEMPLATES (vendor-authenticated)
-// =============================================================================
-
-/**
- * GET /api/vendors/:handle/automations/emails
- * List all email templates for this vendor.
- */
-app.get('/api/vendors/:handle/automations/emails', requireVendorAuth, async (req, res) => {
-  try {
-    const pool = await getPool();
-    const result = await pool.request()
-      .input('vendorHandle', sql.NVarChar, req.params.handle)
-      .query(`
-        SELECT email_id, automation_type, automation_step, delay_hours,
-               subject, html_content, active, created_at, updated_at
-        FROM vendor_emails
-        WHERE vendor_handle = @vendorHandle
-        ORDER BY automation_type, automation_step
-      `);
-    res.json({ emails: result.recordset });
-  } catch (err) {
-    console.error('[Automation] GET emails error:', err.message);
-    res.status(500).json({ error: 'Failed to fetch automation emails' });
-  }
-});
-
-/**
- * POST /api/vendors/:handle/automations/emails
- * Create a new automation email template.
- */
-app.post('/api/vendors/:handle/automations/emails', requireVendorAuth, async (req, res) => {
-  const { automation_type, automation_step = 1, delay_hours = 0, subject, html_content } = req.body;
-
-  if (!automation_type || !subject || !html_content) {
-    return res.status(400).json({ error: 'automation_type, subject, and html_content are required' });
-  }
-
-  const ALLOWED_TYPES = ['welcome', 'post_purchase', 'winback'];
-  if (!ALLOWED_TYPES.includes(automation_type)) {
-    return res.status(400).json({ error: `automation_type must be one of: ${ALLOWED_TYPES.join(', ')}` });
-  }
-
-  try {
-    const pool = await getPool();
-    const result = await pool.request()
-      .input('vendorHandle',   sql.NVarChar, req.params.handle)
-      .input('automationType', sql.NVarChar, automation_type)
-      .input('automationStep', sql.Int,      automation_step)
-      .input('delayHours',     sql.Int,      delay_hours)
-      .input('subject',        sql.NVarChar, subject)
-      .input('htmlContent',    sql.NVarChar, html_content)
-      .query(`
-        INSERT INTO vendor_emails
-          (vendor_handle, automation_type, automation_step, delay_hours, subject, html_content)
-        OUTPUT INSERTED.*
-        VALUES
-          (@vendorHandle, @automationType, @automationStep, @delayHours, @subject, @htmlContent)
-      `);
-    res.status(201).json({ email: result.recordset[0] });
-  } catch (err) {
-    if (err.number === 2627 || err.message.includes('UQ_vendor_email_step')) {
-      return res.status(409).json({ error: `A template for ${automation_type} step ${automation_step} already exists. Use PUT to update it.` });
-    }
-    console.error('[Automation] POST email error:', err.message);
-    res.status(500).json({ error: 'Failed to create automation email' });
-  }
-});
-
-/**
- * PUT /api/vendors/:handle/automations/emails/:emailId
- * Update an existing automation email template.
- */
-app.put('/api/vendors/:handle/automations/emails/:emailId', requireVendorAuth, async (req, res) => {
-  const emailId = parseInt(req.params.emailId, 10);
-  const { subject, html_content, delay_hours, active } = req.body;
-
-  if (!subject && !html_content && delay_hours === undefined && active === undefined) {
-    return res.status(400).json({ error: 'Provide at least one field to update' });
-  }
-
-  try {
-    const pool = await getPool();
-
-    // Confirm ownership
-    const own = await pool.request()
-      .input('emailId',      sql.Int,      emailId)
-      .input('vendorHandle', sql.NVarChar, req.params.handle)
-      .query(`SELECT 1 FROM vendor_emails WHERE email_id = @emailId AND vendor_handle = @vendorHandle`);
-
-    if (!own.recordset.length) {
-      return res.status(404).json({ error: 'Template not found' });
-    }
-
-    const sets   = ['updated_at = GETUTCDATE()'];
-    const inputs = {};
-
-    if (subject      !== undefined) { sets.push('subject = @subject');           inputs.subject      = subject; }
-    if (html_content !== undefined) { sets.push('html_content = @htmlContent');  inputs.htmlContent  = html_content; }
-    if (delay_hours  !== undefined) { sets.push('delay_hours = @delayHours');    inputs.delayHours   = delay_hours; }
-    if (active       !== undefined) { sets.push('active = @active');             inputs.active       = active ? 1 : 0; }
-
-    const request = pool.request()
-      .input('emailId',      sql.Int,      emailId)
-      .input('vendorHandle', sql.NVarChar, req.params.handle);
-
-    if (inputs.subject     !== undefined) request.input('subject',     sql.NVarChar, inputs.subject);
-    if (inputs.htmlContent !== undefined) request.input('htmlContent', sql.NVarChar, inputs.htmlContent);
-    if (inputs.delayHours  !== undefined) request.input('delayHours',  sql.Int,      inputs.delayHours);
-    if (inputs.active      !== undefined) request.input('active',      sql.Bit,      inputs.active);
-
-    const updated = await request.query(`
-      UPDATE vendor_emails
-      SET ${sets.join(', ')}
-      OUTPUT INSERTED.*
-      WHERE email_id = @emailId AND vendor_handle = @vendorHandle
-    `);
-
-    res.json({ email: updated.recordset[0] });
-  } catch (err) {
-    console.error('[Automation] PUT email error:', err.message);
-    res.status(500).json({ error: 'Failed to update automation email' });
-  }
-});
-
-/**
- * DELETE /api/vendors/:handle/automations/emails/:emailId
- * Delete an automation email template.
- */
-app.delete('/api/vendors/:handle/automations/emails/:emailId', requireVendorAuth, async (req, res) => {
-  const emailId = parseInt(req.params.emailId, 10);
-  try {
-    const pool = await getPool();
-    const result = await pool.request()
-      .input('emailId',      sql.Int,      emailId)
-      .input('vendorHandle', sql.NVarChar, req.params.handle)
-      .query(`
-        DELETE FROM vendor_emails
-        OUTPUT DELETED.email_id
-        WHERE email_id = @emailId AND vendor_handle = @vendorHandle
-      `);
-
-    if (!result.recordset.length) {
-      return res.status(404).json({ error: 'Template not found' });
-    }
-    res.json({ deleted: true, email_id: emailId });
-  } catch (err) {
-    console.error('[Automation] DELETE email error:', err.message);
-    res.status(500).json({ error: 'Failed to delete automation email' });
-  }
-});
-
-/**
- * GET /api/vendors/:handle/automations/jobs
- * Recent job history (last 100 rows). Optional: ?type=welcome&status=sent
- */
-app.get('/api/vendors/:handle/automations/jobs', requireVendorAuth, async (req, res) => {
-  const { type, status } = req.query;
-  try {
-    const pool    = await getPool();
-    const request = pool.request()
-      .input('vendorHandle', sql.NVarChar, req.params.handle);
-
-    let where = 'WHERE j.vendor_handle = @vendorHandle';
-    if (type)   { where += ' AND j.automation_type = @type';   request.input('type',   sql.NVarChar, type); }
-    if (status) { where += ' AND j.status = @status';          request.input('status', sql.NVarChar, status); }
-
-    const result = await request.query(`
-      SELECT TOP 100
-        j.job_id,
-        j.automation_type,
-        j.automation_step,
-        j.status,
-        j.scheduled_at,
-        j.processed_at,
-        j.message_id,
-        c.email,
-        c.first_name
-      FROM automation_jobs j
-      INNER JOIN contacts c ON c.contact_id = j.contact_id
-      ${where}
-      ORDER BY j.created_at DESC
-    `);
-    res.json({ jobs: result.recordset });
-  } catch (err) {
-    console.error('[Automation] GET jobs error:', err.message);
-    res.status(500).json({ error: 'Failed to fetch automation jobs' });
-  }
-});
-
-/**
- * GET /api/vendors/:handle/automations/stats
- * Aggregate counts per automation type for dashboard summary cards.
- */
-app.get('/api/vendors/:handle/automations/stats', requireVendorAuth, async (req, res) => {
-  try {
-    const pool = await getPool();
-    const result = await pool.request()
-      .input('vendorHandle', sql.NVarChar, req.params.handle)
-      .query(`
-        SELECT
-          automation_type,
-          COUNT(*)                                                 AS total,
-          SUM(CASE WHEN status = 'sent'    THEN 1 ELSE 0 END)    AS sent,
-          SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END)    AS pending,
-          SUM(CASE WHEN status = 'skipped' THEN 1 ELSE 0 END)    AS skipped,
-          SUM(CASE WHEN status = 'failed'  THEN 1 ELSE 0 END)    AS failed
-        FROM automation_jobs
-        WHERE vendor_handle = @vendorHandle
-        GROUP BY automation_type
-      `);
-    res.json({ stats: result.recordset });
-  } catch (err) {
-    console.error('[Automation] GET stats error:', err.message);
-    res.status(500).json({ error: 'Failed to fetch stats' });
-  }
-});
-
-/**
- * POST /api/vendors/:handle/automations/enqueue
- * Manually enqueue a job — useful for testing or admin re-triggers.
- * Body: { contact_id, automation_type, automation_step?, delay_hours? }
- */
-app.post('/api/vendors/:handle/automations/enqueue', requireVendorAuth, async (req, res) => {
-  const { contact_id, automation_type, automation_step = 1, delay_hours = 0 } = req.body;
-
-  if (!contact_id || !automation_type) {
-    return res.status(400).json({ error: 'contact_id and automation_type are required' });
-  }
-
-  try {
-    const jobId = await enqueueAutomationJob({
-      contactId:      contact_id,
-      vendorHandle:   req.params.handle,
-      automationType: automation_type,
-      automationStep: automation_step,
-      delayHours:     delay_hours,
-    });
-
-    if (jobId === null) {
-      return res.json({ enqueued: false, reason: 'Duplicate — job already exists for this contact/type/step' });
-    }
-
-    res.status(201).json({ enqueued: true, job_id: jobId });
-  } catch (err) {
-    console.error('[Automation] POST enqueue error:', err.message);
-    res.status(500).json({ error: 'Failed to enqueue job' });
   }
 });
 
